@@ -6,9 +6,7 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.annotation.Annotation;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.lang.reflect.Parameter;
+import java.lang.reflect.*;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URLDecoder;
@@ -98,6 +96,17 @@ public class App {
     private final List<Route> routes = new ArrayList<>();
     private HttpServer server;
 
+    private String apiTitle = "fastapi4j";
+    private String apiVersion = "0.1.0";
+    private String apiDescription = null;
+
+    /** Sets the API title shown in the generated OpenAPI spec / Swagger UI. */
+    public App title(String title) { this.apiTitle = title; return this; }
+    /** Sets the API version shown in the generated OpenAPI spec / Swagger UI. */
+    public App version(String version) { this.apiVersion = version; return this; }
+    /** Sets the API description shown in the generated OpenAPI spec / Swagger UI. */
+    public App description(String description) { this.apiDescription = description; return this; }
+
     // ------------------------------------------------------ lambda-style registration
 
     public App get(String path, Handler h)    { return add("GET", path, h); }
@@ -167,7 +176,10 @@ public class App {
 
     private void printBanner(int port) {
         System.out.println("  ⚡ fastapi4j running on http://localhost:" + port);
-        System.out.println("  ⚡ route list: http://localhost:" + port + "/__routes");
+        System.out.println("  ⚡ Swagger UI:   http://localhost:" + port + "/docs");
+        System.out.println("  ⚡ ReDoc:        http://localhost:" + port + "/redoc");
+        System.out.println("  ⚡ OpenAPI spec: http://localhost:" + port + "/openapi.json");
+        System.out.println("  ⚡ route list:   http://localhost:" + port + "/__routes");
         for (Route r : routes) {
             System.out.printf("     %-6s %s%n", r.method, r.rawPath);
         }
@@ -184,6 +196,18 @@ public class App {
             List<Map<String, Object>> list = new ArrayList<>();
             for (Route r : routes) list.add(Map.of("method", r.method, "path", r.rawPath));
             sendJson(exchange, 200, list);
+            return;
+        }
+        if (method.equals("GET") && path.equals("/openapi.json")) {
+            sendJson(exchange, 200, buildOpenApiSpec());
+            return;
+        }
+        if (method.equals("GET") && path.equals("/docs")) {
+            sendHtml(exchange, 200, swaggerUiHtml());
+            return;
+        }
+        if (method.equals("GET") && path.equals("/redoc")) {
+            sendHtml(exchange, 200, redocHtml());
             return;
         }
 
@@ -303,6 +327,15 @@ public class App {
         }
     }
 
+    private void sendHtml(HttpExchange exchange, int status, String html) throws IOException {
+        byte[] out = html.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+        exchange.sendResponseHeaders(status, out.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(out);
+        }
+    }
+
     // -------------------------------------------------------------------- Path utils
 
     private static String normalize(String p) {
@@ -345,5 +378,252 @@ public class App {
 
     private static String urlDecode(String s) {
         return URLDecoder.decode(s, StandardCharsets.UTF_8);
+    }
+
+    // ============================================================= OpenAPI
+
+    /** Builds an OpenAPI 3.0 document describing every registered route, by
+     *  introspecting parameter annotations and record/POJO return & body types.
+     *  Lambda routes (no type info available) are listed with a generic schema. */
+    private Map<String, Object> buildOpenApiSpec() {
+        Map<String, Object> spec = new LinkedHashMap<>();
+        spec.put("openapi", "3.0.3");
+
+        Map<String, Object> info = new LinkedHashMap<>();
+        info.put("title", apiTitle);
+        info.put("version", apiVersion);
+        if (apiDescription != null) info.put("description", apiDescription);
+        spec.put("info", info);
+
+        Map<String, Object> schemas = new LinkedHashMap<>();
+        Map<String, Map<String, Object>> paths = new LinkedHashMap<>();
+
+        for (Route r : routes) {
+            String pathKey = r.rawPath.isEmpty() ? "/" : r.rawPath;
+            Map<String, Object> pathItem = paths.computeIfAbsent(pathKey, k -> new LinkedHashMap<>());
+            pathItem.put(r.method.toLowerCase(), r.javaMethod != null
+                    ? buildOperation(r, schemas)
+                    : buildLambdaOperation(r));
+        }
+
+        spec.put("paths", paths);
+        spec.put("components", Map.of("schemas", schemas));
+        return spec;
+    }
+
+    private Map<String, Object> buildOperation(Route r, Map<String, Object> schemas) {
+        Map<String, Object> op = new LinkedHashMap<>();
+        op.put("operationId", r.controller.getClass().getSimpleName() + "_" + r.javaMethod.getName());
+        op.put("tags", List.of(r.controller.getClass().getSimpleName()));
+
+        List<Map<String, Object>> parameters = new ArrayList<>();
+        Object requestBodySchema = null;
+
+        for (Parameter p : r.javaMethod.getParameters()) {
+            if (p.getType() == Ctx.class) continue;
+
+            if (p.getAnnotation(Body.class) != null) {
+                requestBodySchema = schemaFor(p.getParameterizedType(), schemas);
+                continue;
+            }
+            PathParam pathAnn = p.getAnnotation(PathParam.class);
+            QueryParam queryAnn = p.getAnnotation(QueryParam.class);
+
+            String name;
+            String in;
+            boolean required;
+            String defaultVal = null;
+            if (pathAnn != null) {
+                name = pathAnn.value(); in = "path"; required = true;
+            } else if (queryAnn != null) {
+                name = queryAnn.value(); in = "query"; required = queryAnn.required();
+                if (!queryAnn.defaultValue().equals(NO_DEFAULT)) defaultVal = queryAnn.defaultValue();
+            } else if (r.paramNames.contains(p.getName())) {
+                name = p.getName(); in = "path"; required = true;
+            } else {
+                name = p.getName(); in = "query"; required = true;
+            }
+
+            Map<String, Object> param = new LinkedHashMap<>();
+            param.put("name", name);
+            param.put("in", in);
+            param.put("required", in.equals("path") || required);
+            Map<String, Object> sch = primitiveSchema(p.getType());
+            if (defaultVal != null) sch.put("default", coerceDefault(defaultVal, p.getType()));
+            param.put("schema", sch);
+            parameters.add(param);
+        }
+        if (!parameters.isEmpty()) op.put("parameters", parameters);
+
+        if (requestBodySchema != null) {
+            op.put("requestBody", Map.of(
+                    "required", true,
+                    "content", Map.of("application/json", Map.of("schema", requestBodySchema))));
+        }
+
+        Map<String, Object> responses = new LinkedHashMap<>();
+        Map<String, Object> resp = new LinkedHashMap<>();
+        if (r.javaMethod.getReturnType() == void.class) {
+            resp.put("description", "No Content");
+        } else {
+            resp.put("description", "Successful Response");
+            Object schema = schemaFor(r.javaMethod.getGenericReturnType(), schemas);
+            resp.put("content", Map.of("application/json", Map.of("schema", schema)));
+        }
+        responses.put(String.valueOf(r.successStatus), resp);
+        op.put("responses", responses);
+        return op;
+    }
+
+    /** Lambda routes carry no reflective type info, so we describe them generically. */
+    private Map<String, Object> buildLambdaOperation(Route r) {
+        Map<String, Object> op = new LinkedHashMap<>();
+        op.put("operationId", "handler_" + r.method.toLowerCase() + "_" + Integer.toHexString(System.identityHashCode(r)));
+        if (!r.paramNames.isEmpty()) {
+            List<Map<String, Object>> parameters = new ArrayList<>();
+            for (String name : r.paramNames) {
+                parameters.add(Map.of("name", name, "in", "path", "required", true,
+                        "schema", Map.of("type", "string")));
+            }
+            op.put("parameters", parameters);
+        }
+        op.put("responses", Map.of("200", Map.of("description", "Successful Response")));
+        return op;
+    }
+
+    /** Resolves a reflective Type into an OpenAPI schema, registering object
+     *  schemas (records/POJOs) under components.schemas as it goes. */
+    private Object schemaFor(Type type, Map<String, Object> schemas) {
+        if (type instanceof ParameterizedType pt) {
+            Class<?> raw = (Class<?>) pt.getRawType();
+            if (Collection.class.isAssignableFrom(raw)) {
+                Map<String, Object> arr = new LinkedHashMap<>();
+                arr.put("type", "array");
+                arr.put("items", schemaFor(pt.getActualTypeArguments()[0], schemas));
+                return arr;
+            }
+            if (Map.class.isAssignableFrom(raw)) {
+                Map<String, Object> obj = new LinkedHashMap<>();
+                obj.put("type", "object");
+                obj.put("additionalProperties", schemaFor(pt.getActualTypeArguments()[1], schemas));
+                return obj;
+            }
+            return schemaFor(raw, schemas);
+        }
+        Class<?> c = (Class<?>) type;
+        if (c == void.class || c == Void.class || c == Object.class) return Map.of("type", "object");
+        if (isPrimitiveLike(c)) return primitiveSchema(c);
+        if (c.isEnum()) {
+            List<String> vals = new ArrayList<>();
+            for (Object o : c.getEnumConstants()) vals.add(((Enum<?>) o).name());
+            return Map.of("type", "string", "enum", vals);
+        }
+        if (Collection.class.isAssignableFrom(c)) return Map.of("type", "array", "items", Map.of());
+        if (Map.class.isAssignableFrom(c)) return Map.of("type", "object");
+
+        String name = c.getSimpleName();
+        if (!schemas.containsKey(name)) {
+            schemas.put(name, new LinkedHashMap<>()); // placeholder guards against self-referential recursion
+            Map<String, Object> props = new LinkedHashMap<>();
+            List<String> required = new ArrayList<>();
+            if (c.isRecord()) {
+                for (RecordComponent rc : c.getRecordComponents()) {
+                    props.put(rc.getName(), schemaFor(rc.getGenericType(), schemas));
+                    required.add(rc.getName());
+                }
+            } else {
+                for (Field f : c.getDeclaredFields()) {
+                    if (Modifier.isStatic(f.getModifiers()) || f.isSynthetic()) continue;
+                    props.put(f.getName(), schemaFor(f.getGenericType(), schemas));
+                    required.add(f.getName());
+                }
+            }
+            Map<String, Object> objSchema = new LinkedHashMap<>();
+            objSchema.put("type", "object");
+            objSchema.put("properties", props);
+            objSchema.put("required", required);
+            schemas.put(name, objSchema);
+        }
+        return Map.of("$ref", "#/components/schemas/" + name);
+    }
+
+    private static boolean isPrimitiveLike(Class<?> c) {
+        return c == String.class
+                || c == int.class || c == Integer.class
+                || c == long.class || c == Long.class
+                || c == short.class || c == Short.class
+                || c == double.class || c == Double.class
+                || c == float.class || c == Float.class
+                || c == boolean.class || c == Boolean.class;
+    }
+
+    private static Map<String, Object> primitiveSchema(Class<?> c) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        if (c == int.class || c == Integer.class || c == short.class || c == Short.class) {
+            m.put("type", "integer"); m.put("format", "int32");
+        } else if (c == long.class || c == Long.class) {
+            m.put("type", "integer"); m.put("format", "int64");
+        } else if (c == double.class || c == Double.class || c == float.class || c == Float.class) {
+            m.put("type", "number");
+        } else if (c == boolean.class || c == Boolean.class) {
+            m.put("type", "boolean");
+        } else {
+            m.put("type", "string");
+        }
+        return m;
+    }
+
+    private static Object coerceDefault(String raw, Class<?> type) {
+        try {
+            if (type == int.class || type == Integer.class || type == long.class || type == Long.class
+                    || type == short.class || type == Short.class) return Long.parseLong(raw);
+            if (type == double.class || type == Double.class || type == float.class || type == Float.class)
+                return Double.parseDouble(raw);
+            if (type == boolean.class || type == Boolean.class) return Boolean.parseBoolean(raw);
+        } catch (NumberFormatException ignored) { /* fall through to raw string */ }
+        return raw;
+    }
+
+    private String swaggerUiHtml() {
+        return """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                  <meta charset="utf-8"/>
+                  <title>%s - Swagger UI</title>
+                  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+                </head>
+                <body>
+                  <div id="swagger-ui"></div>
+                  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+                  <script>
+                    window.onload = () => {
+                      window.ui = SwaggerUIBundle({
+                        url: '/openapi.json',
+                        dom_id: '#swagger-ui',
+                        presets: [SwaggerUIBundle.presets.apis],
+                        layout: 'BaseLayout'
+                      });
+                    };
+                  </script>
+                </body>
+                </html>
+                """.formatted(apiTitle);
+    }
+
+    private String redocHtml() {
+        return """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                  <meta charset="utf-8"/>
+                  <title>%s - ReDoc</title>
+                </head>
+                <body>
+                  <redoc spec-url="/openapi.json"></redoc>
+                  <script src="https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js"></script>
+                </body>
+                </html>
+                """.formatted(apiTitle);
     }
 }
