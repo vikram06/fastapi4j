@@ -174,7 +174,40 @@ from the request automatically raises a `422`.
 
 ---
 
-## 7. Status codes
+## 7. Automatic Swagger / OpenAPI docs
+
+Every app automatically exposes:
+
+| Path | What it is |
+|---|---|
+| `/openapi.json` | a generated OpenAPI 3.0 document |
+| `/docs` | Swagger UI, rendered against `/openapi.json` |
+| `/redoc` | ReDoc, rendered against `/openapi.json` |
+
+No configuration needed — the spec is built by introspecting your
+`@RestController` classes: route paths/methods, `@PathParam`/`@QueryParam`
+(including `required`/`defaultValue`), `@Body` types, return types, and
+`@Status` codes. Record and POJO types are recursively converted into
+`components.schemas` entries, the same role Pydantic models play in FastAPI's
+generated docs — nested records, lists, maps, and enums are all resolved.
+
+Set the title/version/description shown in the docs UI:
+
+```java
+app.title("Item API").version("1.0.0").description("Demo API for fastapi4j");
+```
+
+**Swagger UI and ReDoc are loaded from a CDN** (`cdn.jsdelivr.net`) by the
+browser that opens `/docs`/`/redoc` — the Java server itself has zero extra
+dependencies; it just serves a small HTML page and the JSON spec.
+
+**Limitation:** lambda routes (`app.get(...)`) don't carry reflective type
+information, so they appear in the spec with just their path, method, and a
+generic response — annotated controllers get full parameter/schema detail.
+
+---
+
+## 8. Status codes
 
 - Default success status is `200`.
 - `@Status(201)` (or any code) on an annotated method overrides it.
@@ -184,7 +217,7 @@ from the request automatically raises a `422`.
 
 ---
 
-## 8. Full example
+## 9. Full example
 
 ```java
 import fastapi4j.*;
@@ -242,7 +275,7 @@ curl -X POST http://localhost:8000/api/items \
 
 ---
 
-## 9. What's intentionally not included
+## 10. What's intentionally not included
 
 To stay dependency-free and readable, fastapi4j leaves out: HTTPS, WebSockets,
 static file serving, declarative validation constraints (`@Min`/`@Max` etc.),
