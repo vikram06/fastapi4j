@@ -16,6 +16,7 @@ public class Main {
 
     public static void main(String[] args) {
         App app = new App();
+        app.title("Item API").version("1.0.0").description("Demo API for fastapi4j");
 
         // ----- Style 1: lambda routes (Express/Javalin flavor) -----
         app.get("/", ctx -> Map.of("message", "Hello from fastapi4j"));
