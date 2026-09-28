@@ -3,10 +3,12 @@ package fastapi4j;
 /** Throw this from a route handler to return a specific status + JSON error body,
  *  just like FastAPI's HTTPException. */
 public class HttpException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
     public final int statusCode;
 
     public HttpException(int statusCode, String detail) {
         super(detail);
+        if (statusCode < 200 || statusCode > 599) throw new IllegalArgumentException("Status must be 200..599");
         this.statusCode = statusCode;
     }
 

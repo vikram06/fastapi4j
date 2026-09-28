@@ -1,365 +1,258 @@
 package fastapi4j;
 
 import java.lang.reflect.*;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.*;
 
-/**
- * Minimal dependency-free JSON engine. No Jackson/Gson needed.
- *
- * - toJson(Object)        : Java object/record/POJO/List/Map -> JSON string
- * - parse(String)         : JSON string -> Map/List/String/Long/Double/Boolean/null
- * - convert(Object, Type) : generic parsed structure -> a typed Java object,
- *                           including Java records (used the way FastAPI uses
- *                           Pydantic models for request bodies).
- */
+/** Dependency-free JSON with strict syntax, exact integers and bounded nesting. */
 public final class Json {
+    private static final int MAX_DEPTH = 128;
     private Json() {}
 
-    // ============================== SERIALIZE ==============================
-
-    public static String toJson(Object o) {
-        StringBuilder sb = new StringBuilder();
-        write(o, sb);
-        return sb.toString();
+    public static String toJson(Object value) {
+        StringBuilder out = new StringBuilder();
+        write(value, out, new IdentityHashMap<>(), 0);
+        return out.toString();
     }
 
-    @SuppressWarnings("unchecked")
-    private static void write(Object o, StringBuilder sb) {
-        if (o == null) { sb.append("null"); return; }
-        if (o instanceof String s) { writeString(s, sb); return; }
-        if (o instanceof Boolean b) { sb.append(b); return; }
-        if (o instanceof Double || o instanceof Float) {
-            double d = ((Number) o).doubleValue();
-            if (!Double.isNaN(d) && !Double.isInfinite(d) && d == Math.floor(d) && Math.abs(d) < 1e15) {
-                sb.append((long) d).append(".0");
+    private static void write(Object value, StringBuilder out, IdentityHashMap<Object, Boolean> seen, int depth) {
+        if (depth > MAX_DEPTH) throw new IllegalArgumentException("JSON nesting limit exceeded");
+        if (value == null) { out.append("null"); return; }
+        if (value instanceof String || value instanceof Character || value instanceof Enum<?>) {
+            string(value instanceof Enum<?> e ? e.name() : value.toString(), out); return;
+        }
+        if (value instanceof Boolean) { out.append(value); return; }
+        if (value instanceof Number n) {
+            String s = n.toString();
+            if (!s.matches("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?"))
+                throw new IllegalArgumentException("Non-finite or invalid JSON number");
+            out.append(s); return;
+        }
+        if (seen.put(value, true) != null) throw new IllegalArgumentException("Cyclic JSON value");
+        try {
+            if (value instanceof Optional<?> optional) { write(optional.orElse(null), out, seen, depth + 1); return; }
+            if (value instanceof Map<?, ?> map) {
+                out.append('{'); boolean first = true;
+                for (var e : map.entrySet()) {
+                    if (!first) out.append(','); first = false;
+                    string(String.valueOf(e.getKey()), out); out.append(':'); write(e.getValue(), out, seen, depth + 1);
+                }
+                out.append('}'); return;
+            }
+            if (value instanceof Iterable<?> items) {
+                out.append('['); boolean first = true;
+                for (Object item : items) { if (!first) out.append(','); first = false; write(item, out, seen, depth + 1); }
+                out.append(']'); return;
+            }
+            if (value.getClass().isArray()) {
+                out.append('[');
+                for (int i = 0; i < Array.getLength(value); i++) { if (i > 0) out.append(','); write(Array.get(value, i), out, seen, depth + 1); }
+                out.append(']'); return;
+            }
+            out.append('{'); boolean first = true;
+            if (value.getClass().isRecord()) {
+                for (RecordComponent c : value.getClass().getRecordComponents()) {
+                    Method accessor = c.getAccessor(); accessor.setAccessible(true);
+                    if (!first) out.append(','); first = false;
+                    string(c.getName(), out); out.append(':'); write(accessor.invoke(value), out, seen, depth + 1);
+                }
             } else {
-                sb.append(d);
+                for (Field f : fields(value.getClass())) {
+                    f.setAccessible(true);
+                    if (!first) out.append(','); first = false;
+                    string(f.getName(), out); out.append(':'); write(f.get(value), out, seen, depth + 1);
+                }
             }
-            return;
-        }
-        if (o instanceof Number) { sb.append(o); return; }
-        if (o instanceof Enum<?> e) { writeString(e.name(), sb); return; }
-        if (o instanceof Optional<?> opt) { write(opt.orElse(null), sb); return; }
-        if (o instanceof Map<?, ?> m) {
-            sb.append('{');
-            boolean first = true;
-            for (Map.Entry<?, ?> e : m.entrySet()) {
-                if (!first) sb.append(',');
-                first = false;
-                writeString(String.valueOf(e.getKey()), sb);
-                sb.append(':');
-                write(e.getValue(), sb);
-            }
-            sb.append('}');
-            return;
-        }
-        if (o instanceof Iterable<?> it) {
-            sb.append('[');
-            boolean first = true;
-            for (Object x : it) {
-                if (!first) sb.append(',');
-                first = false;
-                write(x, sb);
-            }
-            sb.append(']');
-            return;
-        }
-        if (o.getClass().isArray()) {
-            sb.append('[');
-            int len = Array.getLength(o);
-            for (int i = 0; i < len; i++) {
-                if (i > 0) sb.append(',');
-                write(Array.get(o, i), sb);
-            }
-            sb.append(']');
-            return;
-        }
-        Class<?> cls = o.getClass();
-        if (cls.isRecord()) {
-            sb.append('{');
-            RecordComponent[] comps = cls.getRecordComponents();
-            boolean first = true;
-            for (RecordComponent rc : comps) {
-                try {
-                    Object v = rc.getAccessor().invoke(o);
-                    if (!first) sb.append(',');
-                    first = false;
-                    writeString(rc.getName(), sb);
-                    sb.append(':');
-                    write(v, sb);
-                } catch (Exception ex) { throw new RuntimeException(ex); }
-            }
-            sb.append('}');
-            return;
-        }
-        // plain POJO -> serialize declared instance fields
-        sb.append('{');
-        boolean first = true;
-        for (Field f : cls.getDeclaredFields()) {
-            if (Modifier.isStatic(f.getModifiers()) || f.isSynthetic()) continue;
-            try {
-                f.setAccessible(true);
-                Object v = f.get(o);
-                if (!first) sb.append(',');
-                first = false;
-                writeString(f.getName(), sb);
-                sb.append(':');
-                write(v, sb);
-            } catch (Exception ex) { throw new RuntimeException(ex); }
-        }
-        sb.append('}');
+            out.append('}');
+        } catch (ReflectiveOperationException e) { throw new IllegalArgumentException("Cannot serialize " + value.getClass().getName(), e); }
+        finally { seen.remove(value); }
     }
 
-    private static void writeString(String s, StringBuilder sb) {
-        sb.append('"');
+    private static void string(String s, StringBuilder out) {
+        out.append('"');
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
             switch (c) {
-                case '"': sb.append("\\\""); break;
-                case '\\': sb.append("\\\\"); break;
-                case '\n': sb.append("\\n"); break;
-                case '\r': sb.append("\\r"); break;
-                case '\t': sb.append("\\t"); break;
-                default:
-                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
-                    else sb.append(c);
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> { if (c < 32 || Character.isSurrogate(c)) out.append(String.format("\\u%04x", (int)c)); else out.append(c); }
             }
         }
-        sb.append('"');
+        out.append('"');
     }
 
-    // ================================ PARSE =================================
-
+    /** Throws HTTP 400 for malformed JSON. Empty input is not a JSON value. */
     public static Object parse(String json) {
-        if (json == null || json.isBlank()) return null;
+        if (json == null) throw HttpException.badRequest("Expected JSON body");
         Parser p = new Parser(json);
-        p.skipWs();
-        Object v = p.parseValue();
-        return v;
-    }
-
-    private static final class Parser {
-        final String s;
-        int i = 0;
-        Parser(String s) { this.s = s; }
-
-        void skipWs() { while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++; }
-        char peek() { return s.charAt(i); }
-
-        Object parseValue() {
-            skipWs();
-            char c = peek();
-            switch (c) {
-                case '{': return parseObject();
-                case '[': return parseArray();
-                case '"': return parseString();
-                case 't': expect("true"); return Boolean.TRUE;
-                case 'f': expect("false"); return Boolean.FALSE;
-                case 'n': expect("null"); return null;
-                default: return parseNumber();
-            }
-        }
-
-        void expect(String lit) {
-            if (!s.startsWith(lit, i)) throw new RuntimeException("Invalid JSON near index " + i);
-            i += lit.length();
-        }
-
-        Map<String, Object> parseObject() {
-            Map<String, Object> map = new LinkedHashMap<>();
-            i++; // {
-            skipWs();
-            if (peek() == '}') { i++; return map; }
-            while (true) {
-                skipWs();
-                String key = parseString();
-                skipWs();
-                if (peek() != ':') throw new RuntimeException("Expected ':' at " + i);
-                i++;
-                Object val = parseValue();
-                map.put(key, val);
-                skipWs();
-                char c = peek();
-                if (c == ',') { i++; continue; }
-                if (c == '}') { i++; break; }
-                throw new RuntimeException("Expected ',' or '}' at " + i);
-            }
-            return map;
-        }
-
-        List<Object> parseArray() {
-            List<Object> list = new ArrayList<>();
-            i++; // [
-            skipWs();
-            if (peek() == ']') { i++; return list; }
-            while (true) {
-                Object val = parseValue();
-                list.add(val);
-                skipWs();
-                char c = peek();
-                if (c == ',') { i++; continue; }
-                if (c == ']') { i++; break; }
-                throw new RuntimeException("Expected ',' or ']' at " + i);
-            }
-            return list;
-        }
-
-        String parseString() {
-            if (peek() != '"') throw new RuntimeException("Expected string at " + i);
-            i++;
-            StringBuilder sb = new StringBuilder();
-            while (true) {
-                char c = s.charAt(i++);
-                if (c == '"') break;
-                if (c == '\\') {
-                    char e = s.charAt(i++);
-                    switch (e) {
-                        case '"': sb.append('"'); break;
-                        case '\\': sb.append('\\'); break;
-                        case '/': sb.append('/'); break;
-                        case 'n': sb.append('\n'); break;
-                        case 't': sb.append('\t'); break;
-                        case 'r': sb.append('\r'); break;
-                        case 'b': sb.append('\b'); break;
-                        case 'f': sb.append('\f'); break;
-                        case 'u':
-                            String hex = s.substring(i, i + 4);
-                            sb.append((char) Integer.parseInt(hex, 16));
-                            i += 4;
-                            break;
-                        default: throw new RuntimeException("Bad escape at " + i);
-                    }
-                } else sb.append(c);
-            }
-            return sb.toString();
-        }
-
-        Object parseNumber() {
-            int start = i;
-            if (peek() == '-') i++;
-            while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
-            boolean isDouble = false;
-            if (i < s.length() && s.charAt(i) == '.') {
-                isDouble = true; i++;
-                while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
-            }
-            if (i < s.length() && (s.charAt(i) == 'e' || s.charAt(i) == 'E')) {
-                isDouble = true; i++;
-                if (s.charAt(i) == '+' || s.charAt(i) == '-') i++;
-                while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
-            }
-            String numStr = s.substring(start, i);
-            if (isDouble) return Double.parseDouble(numStr);
-            try { return Long.parseLong(numStr); } catch (NumberFormatException ex) { return Double.parseDouble(numStr); }
-        }
-    }
-
-    // ============================== CONVERT =================================
-
-    /** Converts a generic parsed value (Map/List/String/Number/Boolean) into a typed
-     *  Java value, following the given reflective Type. Supports records, POJOs,
-     *  List&lt;T&gt;, Map&lt;String,T&gt;, enums, and primitives/wrappers. */
-    @SuppressWarnings("unchecked")
-    public static <T> T convert(Object value, Type type) {
-        if (type instanceof Class<?> c) return (T) convertToClass(value, c);
-        if (type instanceof ParameterizedType pt) {
-            Class<?> raw = (Class<?>) pt.getRawType();
-            if (List.class.isAssignableFrom(raw)) {
-                List<?> src = (value instanceof List<?> l) ? l : Collections.emptyList();
-                List<Object> out = new ArrayList<>();
-                Type elemType = pt.getActualTypeArguments()[0];
-                for (Object o : src) out.add(convert(o, elemType));
-                return (T) out;
-            }
-            if (Map.class.isAssignableFrom(raw)) {
-                Map<?, ?> src = (value instanceof Map<?, ?> m) ? m : Collections.emptyMap();
-                Map<String, Object> out = new LinkedHashMap<>();
-                Type valType = pt.getActualTypeArguments()[1];
-                for (Map.Entry<?, ?> e : src.entrySet()) out.put(String.valueOf(e.getKey()), convert(e.getValue(), valType));
-                return (T) out;
-            }
-            return (T) convertToClass(value, raw);
-        }
-        return (T) value;
-    }
-
-    @SuppressWarnings("unchecked")
-    private static Object convertToClass(Object value, Class<?> type) {
-        if (value == null) return defaultForPrimitive(type);
-        if (type == String.class) return String.valueOf(value);
-        if (type == int.class || type == Integer.class) return toNumber(value).intValue();
-        if (type == long.class || type == Long.class) return toNumber(value).longValue();
-        if (type == double.class || type == Double.class) return toNumber(value).doubleValue();
-        if (type == float.class || type == Float.class) return toNumber(value).floatValue();
-        if (type == short.class || type == Short.class) return toNumber(value).shortValue();
-        if (type == boolean.class || type == Boolean.class) return toBoolean(value);
-        if (type.isEnum()) return Enum.valueOf((Class<Enum>) type, String.valueOf(value));
-        if (type == Object.class) return value;
-        if (type.isRecord()) return convertRecord(value, type);
-        if (value instanceof Map) return convertPojo(value, type);
+        Object value = p.value(0); p.ws();
+        if (p.i != json.length()) throw p.error("Trailing content");
         return value;
     }
 
-    private static Object defaultForPrimitive(Class<?> type) {
-        if (type == int.class) return 0;
-        if (type == long.class) return 0L;
-        if (type == double.class) return 0.0;
-        if (type == float.class) return 0.0f;
-        if (type == short.class) return (short) 0;
-        if (type == boolean.class) return false;
-        return null;
-    }
-
-    private static Number toNumber(Object v) {
-        if (v instanceof Number n) return n;
-        if (v instanceof String s) return Double.parseDouble(s);
-        throw new HttpException(422, "Expected a number but got: " + v);
-    }
-
-    private static Boolean toBoolean(Object v) {
-        if (v instanceof Boolean b) return b;
-        if (v instanceof String s) return Boolean.parseBoolean(s);
-        throw new HttpException(422, "Expected a boolean but got: " + v);
-    }
-
-    private static Object convertRecord(Object value, Class<?> type) {
-        if (!(value instanceof Map<?, ?> map)) {
-            throw new HttpException(422, "Expected a JSON object for " + type.getSimpleName());
-        }
-        try {
-            RecordComponent[] comps = type.getRecordComponents();
-            Object[] args = new Object[comps.length];
-            Class<?>[] paramTypes = new Class<?>[comps.length];
-            for (int i = 0; i < comps.length; i++) {
-                RecordComponent rc = comps[i];
-                Object raw = map.get(rc.getName());
-                args[i] = convert(raw, rc.getGenericType());
-                paramTypes[i] = rc.getType();
+    private static final class Parser {
+        final String s; int i;
+        Parser(String s) { this.s = s; }
+        HttpException error(String message) { return HttpException.badRequest(message + " at index " + i); }
+        void ws() { while (i < s.length() && " \t\n\r".indexOf(s.charAt(i)) >= 0) i++; }
+        char peek() { if (i >= s.length()) throw error("Unexpected end of JSON"); return s.charAt(i); }
+        boolean take(char c) { if (i < s.length() && s.charAt(i) == c) { i++; return true; } return false; }
+        void need(char c) { if (!take(c)) throw error("Expected '" + c + "'"); }
+        Object value(int depth) {
+            if (depth > MAX_DEPTH) throw error("JSON nesting limit exceeded");
+            ws(); char c = peek();
+            if (c == '"') return text();
+            if (c == '{') {
+                i++; ws(); Map<String, Object> map = new LinkedHashMap<>();
+                if (take('}')) return map;
+                do {
+                    ws(); String key = text(); ws(); need(':');
+                    if (map.containsKey(key)) throw error("Duplicate object key");
+                    map.put(key, value(depth + 1)); ws();
+                    if (take('}')) return map;
+                    need(',');
+                } while (true);
             }
-            Constructor<?> ctor = type.getDeclaredConstructor(paramTypes);
-            ctor.setAccessible(true);
-            return ctor.newInstance(args);
-        } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Failed to build " + type.getSimpleName() + " from JSON", e);
+            if (c == '[') {
+                i++; ws(); List<Object> list = new ArrayList<>();
+                if (take(']')) return list;
+                do { list.add(value(depth + 1)); ws(); if (take(']')) return list; need(','); } while (true);
+            }
+            for (String literal : List.of("true", "false", "null")) {
+                if (s.startsWith(literal, i)) { i += literal.length(); return literal.equals("null") ? null : literal.equals("true"); }
+            }
+            int start = i; take('-');
+            if (!take('0')) { if (peek() < '1' || peek() > '9') throw error("Expected JSON value"); digits(); }
+            if (take('.')) { int before = i; digits(); if (before == i) throw error("Expected fractional digits"); }
+            if (take('e') || take('E')) { if (!take('+')) take('-'); int before = i; digits(); if (before == i) throw error("Expected exponent digits"); }
+            String number = s.substring(start, i);
+            try {
+                if (number.contains(".") || number.contains("e") || number.contains("E")) return new BigDecimal(number);
+                try { return Long.parseLong(number); } catch (NumberFormatException e) { return new BigInteger(number); }
+            } catch (NumberFormatException e) { throw error("Invalid number"); }
+        }
+        void digits() { while (i < s.length() && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++; }
+        String text() {
+            need('"'); StringBuilder out = new StringBuilder();
+            while (true) {
+                char c = peek(); i++;
+                if (c == '"') return out.toString();
+                if (c < 32) throw error("Unescaped control character");
+                if (c != '\\') { out.append(c); continue; }
+                char e = peek(); i++;
+                switch (e) {
+                    case '"', '\\', '/' -> out.append(e);
+                    case 'b' -> out.append('\b'); case 'f' -> out.append('\f');
+                    case 'n' -> out.append('\n'); case 'r' -> out.append('\r'); case 't' -> out.append('\t');
+                    case 'u' -> {
+                        if (i + 4 > s.length()) throw error("Incomplete Unicode escape");
+                        int code = 0;
+                        for (int j = 0; j < 4; j++) {
+                            char hex = s.charAt(i++);
+                            int digit = "0123456789abcdef".indexOf(Character.toLowerCase(hex));
+                            if (digit < 0) throw error("Invalid Unicode escape"); code = code * 16 + digit;
+                        }
+                        out.append((char)code);
+                    }
+                    default -> throw error("Invalid escape");
+                }
+            }
         }
     }
 
-    private static Object convertPojo(Object value, Class<?> type) {
-        Map<?, ?> map = (Map<?, ?>) value;
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static <T> T convert(Object value, Type type) {
+        if (type instanceof ParameterizedType pt) {
+            Type raw = pt.getRawType();
+            if (raw == Optional.class) return (T) Optional.ofNullable(convert(value, pt.getActualTypeArguments()[0]));
+            if (value == null) return null;
+            if (raw == List.class || raw == Collection.class || raw == Set.class) {
+                if (!(value instanceof List<?> list)) throw invalid("Expected an array");
+                Collection<Object> out = raw == Set.class ? new LinkedHashSet<>() : new ArrayList<>();
+                for (Object item : list) out.add(convert(item, pt.getActualTypeArguments()[0]));
+                return (T) out;
+            }
+            if (raw == Map.class) {
+                if (pt.getActualTypeArguments()[0] != String.class) throw new IllegalArgumentException("Only String map keys are supported");
+                if (!(value instanceof Map<?, ?> map)) throw invalid("Expected an object");
+                Map<String, Object> out = new LinkedHashMap<>();
+                for (var e : map.entrySet()) out.put(String.valueOf(e.getKey()), convert(e.getValue(), pt.getActualTypeArguments()[1]));
+                return (T) out;
+            }
+            throw new IllegalArgumentException("Unsupported generic type: " + type);
+        }
+        if (!(type instanceof Class<?> c)) throw new IllegalArgumentException("Unsupported type: " + type);
+        if (value == null) {
+            if (c.isPrimitive()) throw invalid("Null is not allowed for " + c.getSimpleName());
+            return null;
+        }
         try {
-            Constructor<?> ctor = type.getDeclaredConstructor();
-            ctor.setAccessible(true);
-            Object instance = ctor.newInstance();
-            for (Field f : type.getDeclaredFields()) {
-                if (Modifier.isStatic(f.getModifiers())) continue;
-                if (!map.containsKey(f.getName())) continue;
+            if (c == Object.class) return (T) value;
+            if (c == String.class) { if (!(value instanceof String)) throw invalid("Expected a string"); return (T) value; }
+            if (c == boolean.class || c == Boolean.class) {
+                if (value instanceof Boolean) return (T) value;
+                if (value instanceof String s && (s.equalsIgnoreCase("true") || s.equalsIgnoreCase("false"))) return (T) Boolean.valueOf(s);
+                throw invalid("Expected true or false");
+            }
+            if (c == char.class || c == Character.class) { if (value instanceof String s && s.length() == 1) return (T) Character.valueOf(s.charAt(0)); throw invalid("Expected one character"); }
+            if (c.isPrimitive() || Number.class.isAssignableFrom(c)) {
+                if (!(value instanceof Number || value instanceof String)) throw invalid("Expected a number");
+                BigDecimal n = new BigDecimal(value.toString());
+                if (c == int.class || c == Integer.class) return (T) Integer.valueOf(n.intValueExact());
+                if (c == long.class || c == Long.class) return (T) Long.valueOf(n.longValueExact());
+                if (c == short.class || c == Short.class) return (T) Short.valueOf(n.shortValueExact());
+                if (c == byte.class || c == Byte.class) return (T) Byte.valueOf(n.byteValueExact());
+                if (c == BigInteger.class) return (T) n.toBigIntegerExact();
+                if (c == BigDecimal.class || c == Number.class) return (T) n;
+                if (c == double.class || c == Double.class) { double d = n.doubleValue(); if (!Double.isFinite(d)) throw invalid("Number out of range"); return (T) Double.valueOf(d); }
+                if (c == float.class || c == Float.class) { float f = n.floatValue(); if (!Float.isFinite(f)) throw invalid("Number out of range"); return (T) Float.valueOf(f); }
+            }
+            if (c.isEnum()) return (T) Enum.valueOf((Class<Enum>)c, value.toString());
+            if (c.isArray()) {
+                if (!(value instanceof List<?> list)) throw invalid("Expected an array");
+                Object out = Array.newInstance(c.getComponentType(), list.size());
+                for (int i = 0; i < list.size(); i++) Array.set(out, i, convert(list.get(i), c.getComponentType()));
+                return (T) out;
+            }
+            if (c.isInstance(value)) return (T) value;
+            if (!(value instanceof Map<?, ?> map)) throw invalid("Expected an object for " + c.getSimpleName());
+            if (c.isRecord()) {
+                RecordComponent[] components = c.getRecordComponents();
+                Object[] args = new Object[components.length]; Class<?>[] types = new Class<?>[components.length];
+                for (int i = 0; i < components.length; i++) {
+                    RecordComponent rc = components[i];
+                    args[i] = convert(map.get(rc.getName()), rc.getGenericType());
+                    Validation.check(args[i], rc, rc.getName()); types[i] = rc.getType();
+                }
+                Constructor<?> ctor = c.getDeclaredConstructor(types); ctor.setAccessible(true);
+                return (T) ctor.newInstance(args);
+            }
+            Constructor<?> ctor = c.getDeclaredConstructor(); ctor.setAccessible(true); Object out = ctor.newInstance();
+            for (Field f : fields(c)) {
                 f.setAccessible(true);
-                f.set(instance, convert(map.get(f.getName()), f.getGenericType()));
+                if (map.containsKey(f.getName())) f.set(out, convert(map.get(f.getName()), f.getGenericType()));
+                Validation.check(f.get(out), f, f.getName());
             }
-            return instance;
-        } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Failed to build " + type.getSimpleName() + " from JSON " +
-                    "(does it have a no-arg constructor?)", e);
-        }
+            return (T) out;
+        } catch (NumberFormatException | ArithmeticException e) { throw invalid("Invalid or out-of-range " + c.getSimpleName()); }
+        catch (InvocationTargetException e) {
+            if (e.getCause() instanceof HttpException he) throw he;
+            if (e.getCause() instanceof IllegalArgumentException) throw invalid("Invalid " + c.getSimpleName());
+            throw new IllegalStateException("Model constructor failed: " + c.getName(), e.getCause());
+        } catch (ReflectiveOperationException e) { throw new IllegalArgumentException("Cannot construct " + c.getName(), e); }
+        catch (IllegalArgumentException e) { if (c.isEnum()) throw invalid("Invalid " + c.getSimpleName()); throw e; }
     }
+
+    static List<Field> fields(Class<?> c) {
+        Map<String, Field> fields = new LinkedHashMap<>();
+        for (; c != null && c != Object.class; c = c.getSuperclass())
+            for (Field f : c.getDeclaredFields())
+                if (!Modifier.isStatic(f.getModifiers()) && !Modifier.isTransient(f.getModifiers()) && !f.isSynthetic()) fields.putIfAbsent(f.getName(), f);
+        return new ArrayList<>(fields.values());
+    }
+    private static HttpException invalid(String detail) { return HttpException.unprocessable(detail); }
 }
