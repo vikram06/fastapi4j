@@ -1,284 +1,275 @@
-# fastapi4j — API Reference
+# fastapi4j
 
-A zero-dependency Java web framework with FastAPI-flavored ergonomics, built on
-`com.sun.net.httpserver` and a hand-rolled JSON engine (no Spring, no Jackson,
-no Maven Central).
+A small, dependency-free **Java 21+** HTTP framework inspired by FastAPI.
+Use lambdas or annotated controllers, return records as JSON, and get OpenAPI,
+Swagger UI and ReDoc automatically. Built on the JDK HTTP server and virtual threads.
 
----
+## Quick start
 
-## 1. Installation
-
-There's no build system dependency — just compile the framework sources
-alongside your app. **Compile with `-parameters`** so the framework can read
-your method parameter names (needed for automatic path/query binding without
-annotations):
-
-```bash
-javac -parameters -d out src/fastapi4j/*.java YourApp.java
-java -cp out YourApp
+```sh
+sh build.sh test       # compile and run the dependency-free regression suite
+sh build.sh example    # start the example on port 8000
+sh build.sh jar        # produce build/fastapi4j.jar
 ```
 
-Requires Java 17+ (uses records); the reference implementation targets Java 21.
+No Maven, Gradle, or downloaded runtime dependencies are required. Linux/macOS
+need a JDK 21+ and a POSIX shell. On Windows, compile directly with `javac`:
 
----
-
-## 2. Starting an app
-
-```java
-App app = new App();
-app.get("/", ctx -> Map.of("message", "hello"));
-app.run(8000);
+```sh
+javac --release 21 -parameters -d out src/fastapi4j/*.java example/Main.java
+java -cp out Main
 ```
 
-`App.run(port)` starts an HTTP server on virtual threads and prints a route
-table. `App.stop()` shuts it down.
-
-Every app automatically exposes `GET /__routes`, returning a JSON array of
-`{method, path}` for every registered route — a lightweight stand-in for
-FastAPI's `/docs`.
-
----
-
-## 3. Route style 1 — lambdas
-
-```java
-App app = new App();
-
-app.get("/items/{item_id}",  ctx -> ...);
-app.post("/items",           ctx -> ...);
-app.put("/items/{item_id}",  ctx -> ...);
-app.delete("/items/{item_id}", ctx -> ...);
-app.patch("/items/{item_id}", ctx -> ...);
-```
-
-Each handler is `Ctx -> Object`. Whatever you return is serialized to JSON
-with a `200` status (use `Ctx`/`HttpException` to change that — see §6).
-
-### `Ctx` — the request context
-
-| Method | Description |
-|---|---|
-| `ctx.path(name)` | path param as `String` |
-| `ctx.pathInt(name)` / `ctx.pathLong(name)` | path param parsed as number |
-| `ctx.query(name)` | first query value, or `null` |
-| `ctx.query(name, default)` | first query value, or `default` |
-| `ctx.queryAll(name)` | all values for a repeated query key |
-| `ctx.bodyString()` | raw request body as UTF-8 text |
-| `ctx.body(SomeRecord.class)` | JSON body parsed into a record/POJO |
-| `ctx.header(name)` | request header value |
-| `ctx.exchange` | the raw `HttpExchange`, for anything not covered above |
-
----
-
-## 4. Route style 2 — annotated controllers
-
-Closest to FastAPI's `@app.get(...)` decorators.
-
-```java
-@RestController("/items")           // optional path prefix
-public class Items {
-
-    @Get("/{id}")
-    public Item getOne(int id) { ... }        // "id" bound from the path
-
-    @Get("")
-    public List<Item> list(
-            @QueryParam(value = "skip",  required = false, defaultValue = "0")  int skip,
-            @QueryParam(value = "limit", required = false, defaultValue = "10") int limit) { ... }
-
-    @Post("")
-    @Status(201)
-    public Item create(@Body Item item) { ... }
-
-    @Put("/{id}")
-    public Item update(int id, @Body Item item) { ... }
-
-    @Delete("/{id}")
-    @Status(204)
-    public void remove(int id) { ... }
-}
-
-app.register(new Items());
-```
-
-### Annotations
-
-| Annotation | Applies to | Purpose |
-|---|---|---|
-| `@RestController(prefix)` | class | optional path prefix for every route in the class |
-| `@Get/@Post/@Put/@Delete/@Patch(path)` | method | registers a route; combines with the class prefix |
-| `@PathParam(name)` | parameter | explicit path-param binding (usually not needed — see inference below) |
-| `@QueryParam(name, required, defaultValue)` | parameter | query-param binding, with optional default |
-| `@Body` | parameter | binds the JSON request body into a record/POJO/List/Map |
-| `@Status(code)` | method | overrides the default `200` success status (e.g. `201`, `204`) |
-
-### Automatic parameter inference
-
-If a method parameter has **no annotation**, fastapi4j inspects its name
-(requires `-parameters`):
-
-- If the name matches a `{placeholder}` in the route path → bound as a path param.
-- Otherwise → treated as a **required** query param with that name.
-
-```java
-@Get("/{id}")
-public Item getOne(int id) { ... }          // "id" -> path param, no annotation needed
-```
-
-This mirrors how FastAPI infers parameters from your function signature.
-
----
-
-## 5. Models = Java records
-
-Any `record` works as a request or response model, the way FastAPI uses
-Pydantic `BaseModel`s:
-
-```java
-public record Address(String city, String zip) {}
-public record User(String name, Address address, List<String> tags) {}
-```
-
-- **Serialization**: returning a `User` (or `List<User>`, `Map<String, User>`,
-  etc.) from a handler serializes it to JSON automatically, including nested
-  records, lists, and enums.
-- **Deserialization**: `@Body User user` (or `ctx.body(User.class)`) parses
-  the JSON request body straight into a `User`, recursively converting nested
-  fields.
-- Plain (non-record) classes work too, as long as they have a no-arg
-  constructor — fields are matched by name.
-
-Supported field/parameter types: `String`, `int`/`Integer`, `long`/`Long`,
-`double`/`Double`, `float`/`Float`, `short`/`Short`, `boolean`/`Boolean`,
-enums, records, POJOs, `List<T>`, and `Map<String, T>`.
-
----
-
-## 6. Errors
-
-Throw `HttpException` from any handler to return a specific status with a
-JSON `{"detail": "..."}` body — like FastAPI's `HTTPException`:
-
-```java
-throw HttpException.notFound("Item " + id + " not found");   // 404
-throw HttpException.badRequest("Invalid input");              // 400
-throw HttpException.unprocessable("Missing field");            // 422
-throw new HttpException(409, "Already exists");                // any status
-```
-
-Uncaught exceptions become `500 {"detail": "Internal Server Error: ..."}`,
-and the stack trace is printed server-side.
-
-A required `@QueryParam` (or an inferred required query param) that's missing
-from the request automatically raises a `422`.
-
----
-
-## 7. Automatic Swagger / OpenAPI docs
-
-Every app automatically exposes:
-
-| Path | What it is |
-|---|---|
-| `/openapi.json` | a generated OpenAPI 3.0 document |
-| `/docs` | Swagger UI, rendered against `/openapi.json` |
-| `/redoc` | ReDoc, rendered against `/openapi.json` |
-
-No configuration needed — the spec is built by introspecting your
-`@RestController` classes: route paths/methods, `@PathParam`/`@QueryParam`
-(including `required`/`defaultValue`), `@Body` types, return types, and
-`@Status` codes. Record and POJO types are recursively converted into
-`components.schemas` entries, the same role Pydantic models play in FastAPI's
-generated docs — nested records, lists, maps, and enums are all resolved.
-
-Set the title/version/description shown in the docs UI:
-
-```java
-app.title("Item API").version("1.0.0").description("Demo API for fastapi4j");
-```
-
-**Swagger UI and ReDoc are loaded from a CDN** (`cdn.jsdelivr.net`) by the
-browser that opens `/docs`/`/redoc` — the Java server itself has zero extra
-dependencies; it just serves a small HTML page and the JSON spec.
-
-**Limitation:** lambda routes (`app.get(...)`) don't carry reflective type
-information, so they appear in the spec with just their path, method, and a
-generic response — annotated controllers get full parameter/schema detail.
-
----
-
-## 8. Status codes
-
-- Default success status is `200`.
-- `@Status(201)` (or any code) on an annotated method overrides it.
-- A method with return type `void` automatically responds `204 No Content`.
-- For lambda routes, the status defaults to `200`; throw `HttpException` for
-  anything else.
-
----
-
-## 9. Full example
+Compile application controllers with **`-parameters`** for parameter-name inference.
+Explicit `@PathParam`, `@QueryParam`, `@HeaderParam` and `@Body` bindings do not
+need parameter names. Missing names fail at registration instead of at request time.
 
 ```java
 import fastapi4j.*;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
 
-public class Main {
-    public record Item(String name, double price, boolean isOffer) {}
-
-    static final Map<Integer, Item> DB = new ConcurrentHashMap<>();
-
+public class Hello {
     public static void main(String[] args) {
         App app = new App();
-
-        app.get("/", ctx -> Map.of("message", "Hello from fastapi4j"));
-
-        app.register(new ItemController());
-        app.run(8000);
+        app.get("/", ctx -> Map.of("message", "Hello"));
+        app.get("/hello/{name}", ctx -> Map.of("hello", ctx.path("name")));
+        app.run("127.0.0.1", 8000);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> app.stop(3)));
     }
+}
+```
 
-    @RestController("/api/items")
-    public static class ItemController {
+Open `/docs`, `/redoc`, `/openapi.json`, or `/__routes` on your server.
 
-        @Get("")
-        public Collection<Item> list() { return DB.values(); }
+## Annotated controllers and validation
 
+```java
+import fastapi4j.*;
+import java.util.List;
+
+public class Catalog {
+    public record Item(@NotNull @Size(min = 1, max = 100) String name,
+                       @Range(min = 0) double price) {}
+
+    @RestController("/items")
+    public static class Items {
         @Get("/{id}")
-        public Item getOne(int id) {
-            Item item = DB.get(id);
-            if (item == null) throw HttpException.notFound("Item " + id + " not found");
-            return item;
+        public Object get(long id) {
+            return java.util.Map.of("id", id);
         }
 
         @Post("")
         @Status(201)
-        public Item create(@Body Item item) {
-            DB.put(DB.size() + 1, item);
+        @Operation(summary = "Create item", tags = {"Items"})
+        public Item create(@Body Item item, App.Ctx ctx) {
+            ctx.responseHeader("X-Created-By", "fastapi4j");
             return item;
         }
 
-        @Delete("/{id}")
-        @Status(204)
-        public void remove(int id) {
-            if (DB.remove(id) == null) throw HttpException.notFound("Item " + id + " not found");
+        @Get("")
+        public List<String> list(
+                @QueryParam(value = "tag", required = false) List<String> tags,
+                @QueryParam(value = "limit", defaultValue = "10")
+                @Range(min = 1, max = 100) int limit) {
+            return tags.stream().limit(limit).toList();
         }
     }
 }
 ```
 
-```bash
-curl http://localhost:8000/api/items
-curl -X POST http://localhost:8000/api/items \
-  -d '{"name":"Doohickey","price":4.5,"isOffer":true}'
+Register with `app.register(new Catalog.Items())` before starting the server.
+`@Get`, `@Post`, `@Put`, `@Patch` and `@Delete` combine with the controller prefix.
+An unannotated parameter matching a path placeholder binds from the path;
+other unannotated parameters are required query parameters. `App.Ctx` is injected
+with the live exchange and the same attributes used by middleware.
+
+| Binding / constraint | Behavior |
+|---|---|
+| `@Body` | One JSON body per method; empty/malformed JSON → 400, null body → 422 |
+| `@PathParam("id")` | Explicit path parameter name |
+| `@QueryParam("q")` | Required query value by default |
+| `@HeaderParam("X-Token")` | Case-insensitive request header binding |
+| `required = false` | Missing reference → null; `Optional<T>` → empty; list → empty; primitive → zero/false |
+| `defaultValue = "10"` | Used when missing, even when `required` is true |
+| `List<T>`, `Set<T>`, `Collection<T>` | Repeated query/header values converted element by element |
+| `@NotNull` | Reject null |
+| `@Range(min = ..., max = ...)` | Inclusive numeric bounds |
+| `@Size(min = ..., max = ...)` | Bounds string UTF-16 length, collection/map size, or array length |
+
+Validation constraints work on parameters, record components and POJO fields.
+Nested body models are converted and validated recursively. Missing/null primitive
+record fields fail with 422; nullable reference fields remain optional unless marked
+`@NotNull`. POJOs retain constructor/field defaults for absent fields. Unknown JSON
+properties are ignored. POJOs need a no-argument constructor; inherited fields are
+included, while static, synthetic and transient fields are excluded.
+
+## Responses
+
+Returning an ordinary Java value serializes it to JSON, with status 200 by default.
+`@Status` changes an annotated route's status. A `void` method defaults to 204;
+an explicit `@Status` is honored. Lambda handlers can call `ctx.status(201)`.
+
+Use `Response` when status, representation or headers matter:
+
+```java
+app.post("/created", ctx -> Response.json(201, Map.of("id", 1))
+        .header("Location", "/items/1"));
+app.get("/text", ctx -> Response.text("Hello"));
+app.get("/page", ctx -> Response.html("<h1>Hello</h1>"));
+app.get("/old", ctx -> Response.redirect("/text")); // 303; .status(307) to override
+app.delete("/cache", ctx -> Response.noContent());
+app.get("/download", ctx -> Response.bytes(200, new byte[]{1, 2, 3}, "application/octet-stream"));
 ```
 
----
+Responses are immutable. A returned `Response` takes precedence over `@Status`
+and `ctx.status`. HEAD responses omit bodies, and 204/205/304 always suppress bodies.
+The server owns Content-Length and Transfer-Encoding. Do not write directly to the
+exchange response stream; use response objects or `ctx.responseHeader`.
 
-## 10. What's intentionally not included
+## Middleware and errors
 
-To stay dependency-free and readable, fastapi4j leaves out: HTTPS, WebSockets,
-static file serving, declarative validation constraints (`@Min`/`@Max` etc.),
-automatic OpenAPI/Swagger UI generation, and a middleware/interceptor chain.
-All of these can be layered on top of the existing `App`/`Route` structure if
-you need them.
+```java
+app.use((ctx, next) -> {
+    long start = System.nanoTime();
+    ctx.attribute("service", "catalog");
+    try {
+        return next.handle();
+    } finally {
+        ctx.responseHeader("X-Response-Time-Ms",
+                Long.toString((System.nanoTime() - start) / 1_000_000));
+    }
+});
+
+app.use((ctx, next) -> {
+    // Supply your application's authentication check here.
+    if (ctx.header("Authorization") == null) {
+        return Response.json(401, Map.of("detail", "Authentication required"));
+    }
+    return next.handle();
+});
+```
+
+Middleware runs in registration order and wraps the handler, including docs,
+404 and 405 responses. Call `next.handle()` once or return early. Request bodies
+are bounded and read before middleware; malformed URLs and oversized bodies fail
+before middleware runs. Configured CORS preflight responses run before middleware.
+
+`HttpException.notFound(...)`, `.badRequest(...)`, `.unprocessable(...)`, or
+`new HttpException(status, detail)` produce a JSON `detail` response. Malformed JSON
+returns 400; type/constraint errors return 422; unsupported JSON body media types
+return 415. JSON Content-Type may be absent for compatibility; if present it must
+be `application/json` or an `application/*+json` type.
+
+Unexpected exceptions return a generic 500, with details logged only on the server.
+Every response gets a generated `X-Request-ID` and `X-Content-Type-Options: nosniff`.
+
+```java
+app.onError((ctx, exception) -> {
+    if (exception instanceof HttpException error) {
+        return Response.json(error.statusCode, Map.of("detail", error.getMessage()));
+    }
+    return Response.json(500, Map.of("detail", "Unexpected error", "requestId", ctx.requestId()));
+});
+```
+
+The custom error handler receives errors after a context exists, including binding
+and middleware errors. Failures before context creation use the default handler.
+
+## CORS
+
+CORS is off by default. Enable an explicit origin allowlist:
+
+```java
+app.cors(Cors.allowOrigins("https://app.example.com", "http://localhost:3000"));
+```
+
+This allows standard API methods and the `Content-Type`/`Authorization` headers.
+For credentials or custom headers, use a policy:
+
+```java
+app.cors(new Cors(
+        java.util.Set.of("https://app.example.com"),
+        java.util.Set.of("GET", "HEAD", "POST", "OPTIONS"),
+        java.util.Set.of("content-type", "authorization", "x-token"),
+        true, 600));
+```
+
+Credentialed CORS rejects wildcard origins. Preflight checks both the policy and
+registered route methods. CORS does not authenticate requests; browsers enforce
+access to responses. Disallowed origins receive no CORS grant, and disallowed
+preflight requests receive 403. Validation/handler errors retain CORS headers;
+errors before context creation do not.
+
+## Routing and request context
+
+- Literal routes take priority over parameter routes, independent of registration order.
+- Duplicate method/path shapes (such as `/x/{id}` and `/x/{name}`) fail at startup.
+- Matching ignores trailing slashes. Path parameters decode once, preserving `+`;
+  `%2F` stays inside its captured parameter and becomes `/` in its value.
+- Literal URL components in registered routes should use their URI-encoded form.
+- GET provides implicit HEAD; explicit `app.head(...)` overrides it.
+- OPTIONS supplies an Allow header; unsupported methods on known paths return 405.
+- `app.route(method, path, handler)` supports GET, HEAD, POST, PUT, PATCH, DELETE,
+  OPTIONS and TRACE. `app.options(...)` registers a custom OPTIONS handler.
+
+`Ctx` exposes `path`, `pathInt`, `pathLong`, `query`, `query(name, fallback)`,
+`queryAll`, `queryInt(name, fallback)`, `bodyString`, `body(Class)`, `header`,
+`method`, `requestId`, `status`, `responseHeader` and request-local `attribute`
+get/set methods. `pathParams` and `queryParams` are immutable snapshots;
+`rawBody` and the raw `exchange` remain available for advanced integrations.
+
+## JSON behavior
+
+The parser rejects trailing garbage, duplicate keys, unescaped control characters,
+invalid number syntax, invalid escapes and nesting beyond 128 levels. Integer
+values use Long or BigInteger; decimal/exponent values use BigDecimal. Conversion
+to integer types is exact, with overflow/fraction rejection; booleans accept only
+true/false (case-insensitive when converting strings).
+
+Supported models include records, POJOs, primitives/wrappers, enums, arrays,
+`Optional<T>`, `List<T>`, `Set<T>`, `Collection<T>` and `Map<String,T>`.
+Serialization rejects cycles, non-finite numbers and excessive nesting. Generic
+user-defined models and unresolved type variables are not supported for conversion.
+
+## OpenAPI and documentation
+
+`app.title(...)`, `.version(...)` and `.description(...)` customize the API info.
+`@Operation(summary = ..., description = ..., tags = {...}, deprecated = true)`
+adds route documentation. Generated schemas include nested models, arrays, enums,
+validation constraints, typed repeated parameters and header bindings. Schema
+names use qualified class names to avoid collisions, and operation IDs are stable.
+Use `app.buildOpenApiSpec()` to inspect/export the spec without starting a server.
+
+Lambda routes and `Response` return values have no reflective payload schema;
+add application-specific documentation when you use those. Dynamic statuses and
+custom error handlers are not inferred. Nullable reference fields are optional in
+schemas, but explicit-null acceptance is not fully described for every model type.
+
+Swagger UI and ReDoc assets load from jsDelivr in the browser. Disable the built-in
+documentation and route listing with `app.docs(false)`. Built-in documentation paths
+are reserved while enabled. HTML titles are escaped.
+
+## Server lifecycle and deployment
+
+```java
+try (App app = new App().maxBodyBytes(256 * 1024).docs(false)) {
+    app.get("/health", ctx -> Map.of("status", "ok"));
+    app.run("127.0.0.1", 0); // OS-assigned port; read app.port()
+    // Keep your application running here. Closing this scope stops the server.
+}
+```
+
+Configure routes, middleware and settings before `run`. `run(port)` binds all
+interfaces; `run(host, port)` selects an address. `stop()` stops immediately;
+`stop(delaySeconds)` allows in-flight requests up to that delay, then releases
+the virtual-thread executor. Restarting a stopped app is supported.
+
+The default body limit is **1 MiB**, enforced for fixed-length and chunked requests.
+This is a compact framework, not a full production server platform. Use a reverse
+proxy for TLS, request/header timeouts, connection limits and rate limiting.
+Handlers run concurrently, so application state must be thread-safe. There is no
+built-in persistence, WebSocket support, multipart upload, streaming response,
+static-file hosting, authentication provider or dependency-injection container.
+
+See [CHANGELOG.md](CHANGELOG.md) for compatibility changes and
+[CONTRIBUTING.md](CONTRIBUTING.md) for development instructions.

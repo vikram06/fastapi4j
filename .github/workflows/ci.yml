@@ -1,0 +1,21 @@
+name: Java CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java: ['21', '25']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - run: sh build.sh test
+      - run: sh build.sh jar
+      - run: javac --release 21 -parameters -cp build/classes -d build/classes example/Main.java
